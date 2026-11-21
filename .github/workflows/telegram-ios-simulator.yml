@@ -1,0 +1,231 @@
+# Собирает свежий Telegram для iOS (из github.com/TelegramMessenger/Telegram-iOS)
+# под iOS Simulator и загружает его на Appetize.io, где он запускается в браузере.
+
+name: Telegram iOS Simulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Тип сборки"
+        type: choice
+        options: [debug_sim_arm64, release_sim_arm64]
+        default: debug_sim_arm64
+      upload_artifact:
+        description: "Сохранить zip как artifact (в публичном репо его сможет скачать любой, а внутри ваш api_hash)"
+        type: boolean
+        default: false
+  schedule:
+    # Каждый день в 03:00 UTC. Если в Telegram-iOS нет новых коммитов, сборка пропускается.
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: telegram-ios-simulator
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    env:
+      UPSTREAM: https://github.com/TelegramMessenger/Telegram-iOS.git
+      CONFIGURATION: ${{ inputs.configuration || 'debug_sim_arm64' }}
+
+    steps:
+      - name: Последний коммит Telegram-iOS
+        id: upstream
+        run: |
+          SHA=$(git ls-remote "$UPSTREAM" refs/heads/master | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "Коммит: $SHA"
+
+      - name: Этот коммит уже собран?
+        id: marker
+        uses: actions/cache/restore@v4
+        with:
+          path: .built-marker
+          key: tg-built-${{ steps.upstream.outputs.sha }}-${{ env.CONFIGURATION }}
+          lookup-only: true
+
+      - name: Решаем, собирать ли
+        id: go
+        run: |
+          if [ "${{ steps.marker.outputs.cache-hit }}" = "true" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Новых коммитов нет, сборка не нужна." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Проверка секретов
+        if: steps.go.outputs.run == 'true'
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Добавьте секреты TG_API_ID и TG_API_HASH (Settings → Secrets and variables → Actions). Получить их можно на https://my.telegram.org/apps"
+            exit 1
+          fi
+
+      - name: Скачать исходники Telegram-iOS
+        if: steps.go.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: TelegramMessenger/Telegram-iOS
+          ref: ${{ steps.upstream.outputs.sha }}
+          submodules: recursive
+          path: telegram-ios
+
+      - name: Выбрать Xcode из versions.json и освободить место
+        if: steps.go.outputs.run == 'true'
+        working-directory: telegram-ios
+        run: |
+          XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')
+          APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+          XCODE_APP=""
+          for candidate in "/Applications/Xcode_${XCODE_VERSION}.app" "/Applications/Xcode_${XCODE_VERSION}_Release_Candidate.app"; do
+            if [ -d "$candidate" ]; then XCODE_APP="$candidate"; break; fi
+          done
+          if [ -z "$XCODE_APP" ]; then
+            echo "::error::Telegram требует Xcode $XCODE_VERSION, а на раннере его нет. Установлены: $(ls -d /Applications/Xcode*.app | tr '\n' ' ')"
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+          # Остальные версии Xcode не нужны, а места на диске сборке нужно много
+          for x in /Applications/Xcode*.app; do
+            if [ "$x" != "$XCODE_APP" ] && [ ! -L "$x" ]; then sudo rm -rf "$x"; fi
+          done
+          df -h /
+
+      - name: Конфигурация сборки
+        if: steps.go.outputs.run == 'true'
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          # Постоянный bundle id, чтобы каждое обновление было тем же приложением
+          BUNDLE_SUFFIX=$(echo -n "$GITHUB_REPOSITORY" | shasum | cut -c1-16)
+          mkdir -p "$HOME/telegram-configuration"
+          cat > "$HOME/telegram-configuration/config.json" <<EOF
+          {
+            "bundle_id": "org.${BUNDLE_SUFFIX}.Telegram",
+            "api_id": "${TG_API_ID}",
+            "api_hash": "${TG_API_HASH}",
+            "team_id": "XXXXXXXXXX",
+            "is_internal_build": "true",
+            "is_appstore_build": "false",
+            "appstore_id": "0",
+            "app_specific_url_scheme": "tg",
+            "premium_iap_product_id": "",
+            "enable_siri": false,
+            "enable_icloud": false
+          }
+          EOF
+
+      - name: Кэш Bazel (ускоряет следующие сборки)
+        if: steps.go.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ env.CONFIGURATION }}-${{ steps.upstream.outputs.sha }}
+          restore-keys: |
+            bazel-${{ env.CONFIGURATION }}-
+
+      - name: Сборка (это долго)
+        if: steps.go.outputs.run == 'true'
+        working-directory: telegram-ios
+        run: |
+          set -x
+          python3 -u build-system/Make/Make.py \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath="$HOME/telegram-configuration/config.json" \
+            --disableProvisioningProfiles \
+            --configuration="$CONFIGURATION" \
+            --buildNumber="${{ github.run_number }}"
+
+      - name: Упаковать Telegram.app
+        if: steps.go.outputs.run == 'true'
+        working-directory: telegram-ios
+        run: |
+          rm -rf out && mkdir out
+          IPA=$(find bazel-out/ -maxdepth 4 -path '*sim*' -name 'Telegram.ipa' -print -quit 2>/dev/null || true)
+          if [ -z "$IPA" ]; then
+            IPA=$(find bazel-out/ -maxdepth 4 -name 'Telegram.ipa' -print -quit 2>/dev/null || true)
+          fi
+
+          if [ -n "$IPA" ]; then
+            echo "Найден $IPA"
+            unzip -q "$IPA" -d out/ipa
+            APP_DIR="out/ipa/Payload/Telegram.app"
+          else
+            APP_DIR=$(find bazel-out/ -maxdepth 4 -type d -name 'Telegram.app' -print -quit 2>/dev/null || true)
+          fi
+
+          if [ -z "$APP_DIR" ] || [ ! -d "$APP_DIR" ]; then
+            echo "::error::Не нашёл собранный Telegram.app"
+            find bazel-out/ -maxdepth 4 \( -name '*.ipa' -o -name '*.app' \) || true
+            exit 1
+          fi
+
+          file "$APP_DIR/Telegram"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$GITHUB_WORKSPACE/Telegram-sim.zip"
+          ls -lh "$GITHUB_WORKSPACE/Telegram-sim.zip"
+
+      - name: Загрузить на Appetize.io
+        if: steps.go.outputs.run == 'true'
+        env:
+          APPETIZE_TOKEN: ${{ secrets.APPETIZE_TOKEN }}
+          APPETIZE_PUBLIC_KEY: ${{ secrets.APPETIZE_PUBLIC_KEY }}
+          SHORT_SHA: ${{ steps.upstream.outputs.short }}
+        run: |
+          if [ -z "$APPETIZE_TOKEN" ]; then
+            echo "Секрета APPETIZE_TOKEN нет, загрузку пропускаю." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -n "$APPETIZE_PUBLIC_KEY" ]; then
+            URL="https://api.appetize.io/v1/apps/$APPETIZE_PUBLIC_KEY"
+          else
+            URL="https://api.appetize.io/v1/apps"
+          fi
+          RESP=$(curl -sS --fail-with-body -X POST "$URL" \
+            -H "X-API-KEY: $APPETIZE_TOKEN" \
+            -F "file=@$GITHUB_WORKSPACE/Telegram-sim.zip" \
+            -F "platform=ios" \
+            -F "note=Telegram $APP_VERSION ($SHORT_SHA)")
+          PUBLIC_KEY=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["publicKey"])')
+          {
+            echo "## Telegram $APP_VERSION ($SHORT_SHA) готов"
+            echo ""
+            echo "Открыть: https://appetize.io/app/$PUBLIC_KEY"
+            if [ -z "$APPETIZE_PUBLIC_KEY" ]; then
+              echo ""
+              echo "Сохраните \`$PUBLIC_KEY\` в секрет **APPETIZE_PUBLIC_KEY**, чтобы следующие сборки обновляли это же приложение, а не создавали новое."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Сохранить zip как artifact
+        if: steps.go.outputs.run == 'true' && inputs.upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-sim-${{ steps.upstream.outputs.short }}
+          path: Telegram-sim.zip
+          retention-days: 3
+
+      - name: Отметить коммит как собранный
+        if: steps.go.outputs.run == 'true'
+        run: echo "${{ steps.upstream.outputs.sha }}" > .built-marker
+
+      - name: Сохранить отметку
+        if: steps.go.outputs.run == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .built-marker
+          key: tg-built-${{ steps.upstream.outputs.sha }}-${{ env.CONFIGURATION }}
