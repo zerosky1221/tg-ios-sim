@@ -135,7 +135,22 @@ jobs:
         working-directory: telegram-ios
         run: |
           set -x
-          # Тестовые сертификаты из репозитория Telegram, как в их собственном CI
+          # Make.py требует источник подписи, поэтому даём тестовые профили из репозитория Telegram.
+          # Но у них может истечь срок, а для симулятора они не нужны, поэтому включаем
+          # --//Telegram:disableProvisioningProfiles: метод для этого в Make.py есть,
+          # но команда build его не вызывает.
+          python3 - <<'PY'
+          import re
+          path = "build-system/Make/Make.py"
+          src = open(path).read()
+          patched, n = re.subn(r"^(\s*)bazel_command_line\.invoke_build\(\)",
+                               r"\1bazel_command_line.set_disable_provisioning_profiles()\n\1bazel_command_line.invoke_build()",
+                               src, flags=re.M)
+          if n == 0 or "def set_disable_provisioning_profiles" not in src:
+              raise SystemExit("Make.py изменился: не нашёл invoke_build/set_disable_provisioning_profiles")
+          open(path, "w").write(patched)
+          print(f"Make.py: отключение профилей добавлено в {n} мест(а)")
+          PY
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           python3 -u build-system/Make/Make.py \
             --cacheDir="$HOME/telegram-bazel-cache" \
