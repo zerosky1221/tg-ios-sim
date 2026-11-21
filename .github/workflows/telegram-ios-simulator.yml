@@ -129,15 +129,8 @@ jobs:
           }
           EOF
 
-      - name: Кэш Bazel (ускоряет следующие сборки)
-        if: steps.go.outputs.run == 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/telegram-bazel-cache
-          key: bazel-${{ env.CONFIGURATION }}-${{ steps.upstream.outputs.sha }}
-          restore-keys: |
-            bazel-${{ env.CONFIGURATION }}-
-
+      # Кэш Bazel здесь намеренно не сохраняется: скомпилированные файлы содержат api_hash,
+      # а кэш публичного репозитория может прочитать workflow из pull request форка.
       - name: Сборка (это долго)
         if: steps.go.outputs.run == 'true'
         working-directory: telegram-ios
