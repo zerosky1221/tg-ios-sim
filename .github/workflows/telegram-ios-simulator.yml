@@ -110,15 +110,14 @@ jobs:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
-          # Постоянный bundle id, чтобы каждое обновление было тем же приложением
-          BUNDLE_SUFFIX=$(echo -n "$GITHUB_REPOSITORY" | shasum | cut -c1-16)
+          # bundle_id и team_id должны совпадать с тестовыми профилями из build-system/fake-codesigning
           mkdir -p "$HOME/telegram-configuration"
           cat > "$HOME/telegram-configuration/config.json" <<EOF
           {
-            "bundle_id": "org.${BUNDLE_SUFFIX}.Telegram",
+            "bundle_id": "ph.telegra.Telegraph",
             "api_id": "${TG_API_ID}",
             "api_hash": "${TG_API_HASH}",
-            "team_id": "XXXXXXXXXX",
+            "team_id": "C67CF9S4VU",
             "is_internal_build": "true",
             "is_appstore_build": "false",
             "appstore_id": "0",
@@ -136,11 +135,13 @@ jobs:
         working-directory: telegram-ios
         run: |
           set -x
+          # Тестовые сертификаты из репозитория Telegram, как в их собственном CI
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           python3 -u build-system/Make/Make.py \
             --cacheDir="$HOME/telegram-bazel-cache" \
             build \
             --configurationPath="$HOME/telegram-configuration/config.json" \
-            --disableProvisioningProfiles \
+            --codesigningInformationPath=build-system/fake-codesigning \
             --configuration="$CONFIGURATION" \
             --buildNumber="${{ github.run_number }}"
 
